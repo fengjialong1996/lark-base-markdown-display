@@ -3,6 +3,73 @@ import { bitable } from '@lark-base-open/js-sdk';
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import md from '../lib/markdown.js';
 
+const DEMO_MARKDOWN = `# Markdown 渲染预览（Demo 模式）
+
+> 当前在本地浏览器中运行，未连接飞书多维表格 SDK。
+> 请在飞书多维表格中通过"添加插件"加载本插件。
+
+---
+
+## 支持的 Markdown 特性
+
+### 文本格式
+**粗体** / *斜体* / ~~删除线~~ / \`行内代码\`
+
+### 列表
+- 无序列表项 A
+  - 嵌套项 A-1
+  - 嵌套项 A-2
+- 无序列表项 B
+
+1. 有序列表第一项
+2. 有序列表第二项
+
+### 链接与图片
+[飞书多维表格开发文档](https://bytedance.feishu.cn/docx/HazFdSHH9ofRGKx8424cwzLlnZc)
+
+### 表格
+| 层级 | 名称 | 说明 |
+|------|------|------|
+| L0 | Entity | 发行人 / 主体 |
+| L1 | Instrument | 金融工具 |
+| L2 | Tradable | 可交易对象 |
+
+### 代码高亮
+
+\`\`\`sql
+SELECT name, last_source_change_id
+FROM entity_attribute
+WHERE entity_id = 42;
+\`\`\`
+
+\`\`\`yaml
+assert:
+  row_count: 1
+  fields:
+    name:
+      equals: "ACME Corp"
+\`\`\`
+
+\`\`\`javascript
+const selection = await bitable.base.getSelection();
+console.log(selection.tableId, selection.fieldId);
+\`\`\`
+
+### 引用块
+> 这是一段引用文本，可以嵌套 **粗体** 和 \`代码\`。
+`;
+
+const SDK_TIMEOUT_MS = 3000;
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('__SDK_TIMEOUT__')), ms)
+    ),
+  ]);
+}
+
 export default {
   name: 'MarkdownViewer',
   setup() {
@@ -12,6 +79,7 @@ export default {
     const loading = ref(true);
     const errorMsg = ref('');
     const noSelection = ref(false);
+    const demoMode = ref(false);
 
     let cancelSelectionWatch = null;
     let fetchSeq = 0;
@@ -35,7 +103,17 @@ export default {
       try { return JSON.stringify(cellValue, null, 2); } catch { return String(cellValue); }
     }
 
+    function enterDemoMode() {
+      demoMode.value = true;
+      rawText.value = DEMO_MARKDOWN;
+      tableName.value = 'Demo';
+      fieldName.value = '预览';
+      loading.value = false;
+    }
+
     async function loadCell() {
+      if (demoMode.value) return;
+
       const seq = ++fetchSeq;
       loading.value = true;
       errorMsg.value = '';
@@ -45,7 +123,10 @@ export default {
       tableName.value = '';
 
       try {
-        const selection = await bitable.base.getSelection();
+        const selection = await withTimeout(
+          bitable.base.getSelection(),
+          SDK_TIMEOUT_MS
+        );
 
         if (seq !== fetchSeq) return;
 
@@ -76,6 +157,11 @@ export default {
         rawText.value = extractCellText(cellValue);
       } catch (err) {
         if (seq !== fetchSeq) return;
+        if (err?.message === '__SDK_TIMEOUT__') {
+          console.warn('[MarkdownViewer] SDK 超时，进入 Demo 模式');
+          enterDemoMode();
+          return;
+        }
         console.error('[MarkdownViewer] loadCell error:', err);
         errorMsg.value = err?.message || '读取单元格失败';
       } finally {
@@ -90,9 +176,13 @@ export default {
 
     onMounted(() => {
       loadCell();
-      cancelSelectionWatch = bitable.base.onSelectionChange(() => {
-        loadCell();
-      });
+      try {
+        cancelSelectionWatch = bitable.base.onSelectionChange(() => {
+          loadCell();
+        });
+      } catch (e) {
+        console.warn('[MarkdownViewer] onSelectionChange 注册失败:', e);
+      }
     });
 
     onUnmounted(() => {
@@ -110,6 +200,7 @@ export default {
       loading,
       errorMsg,
       noSelection,
+      demoMode,
       renderedHtml,
     };
   },
