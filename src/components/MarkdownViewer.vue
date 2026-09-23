@@ -1,5 +1,5 @@
 <script>
-import { bitable } from '@lark-base-open/js-sdk';
+import { bitable, FieldType } from '@lark-base-open/js-sdk';
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import md from '../lib/markdown.js';
 
@@ -60,6 +60,7 @@ console.log(selection.tableId, selection.fieldId);
 `;
 
 const SDK_TIMEOUT_MS = 3000;
+const EDITABLE_FIELD_TYPES = new Set([FieldType.Text]);
 
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -81,8 +82,18 @@ export default {
     const noSelection = ref(false);
     const demoMode = ref(false);
 
+    const editing = ref(false);
+    const editText = ref('');
+    const saving = ref(false);
+    const saveMsg = ref('');
+    const fieldEditable = ref(false);
+
+    let currentTableId = null;
+    let currentFieldId = null;
+    let currentRecordId = null;
     let cancelSelectionWatch = null;
     let fetchSeq = 0;
+    let saveMsgTimer = null;
 
     function extractCellText(cellValue) {
       if (cellValue == null) return '';
@@ -103,13 +114,24 @@ export default {
       try { return JSON.stringify(cellValue, null, 2); } catch { return String(cellValue); }
     }
 
+    function showSaveMsg(text, durationMs = 2000) {
+      saveMsg.value = text;
+      clearTimeout(saveMsgTimer);
+      saveMsgTimer = setTimeout(() => { saveMsg.value = ''; }, durationMs);
+    }
+
     function enterDemoMode() {
       demoMode.value = true;
       rawText.value = DEMO_MARKDOWN;
       tableName.value = 'Demo';
       fieldName.value = '预览';
+      fieldEditable.value = true;
       loading.value = false;
     }
+
+    const hasUnsavedChanges = computed(() => {
+      return editing.value && editText.value !== rawText.value;
+    });
 
     async function loadCell() {
       if (demoMode.value) return;
@@ -121,6 +143,12 @@ export default {
       rawText.value = '';
       fieldName.value = '';
       tableName.value = '';
+      editing.value = false;
+      editText.value = '';
+      fieldEditable.value = false;
+      currentTableId = null;
+      currentFieldId = null;
+      currentRecordId = null;
 
       try {
         const selection = await withTimeout(
@@ -150,6 +178,11 @@ export default {
 
         fieldName.value = fieldMeta?.name || fieldId;
         tableName.value = tableMeta?.name || tableId;
+        fieldEditable.value = EDITABLE_FIELD_TYPES.has(fieldMeta?.type);
+
+        currentTableId = tableId;
+        currentFieldId = fieldId;
+        currentRecordId = recordId;
 
         const cellValue = await table.getCellValue(fieldId, recordId);
         if (seq !== fetchSeq) return;
@@ -169,16 +202,63 @@ export default {
       }
     }
 
+    function enterEdit() {
+      editText.value = rawText.value;
+      editing.value = true;
+    }
+
+    function exitEdit() {
+      rawText.value = editText.value;
+      editing.value = false;
+    }
+
+    async function saveCell() {
+      if (demoMode.value) return;
+      if (!currentTableId || !currentFieldId || !currentRecordId) return;
+
+      saving.value = true;
+      errorMsg.value = '';
+      try {
+        const table = await bitable.base.getTableById(currentTableId);
+        await table.setCellValue(currentFieldId, currentRecordId, editText.value);
+        rawText.value = editText.value;
+        editing.value = false;
+        showSaveMsg('已保存');
+      } catch (err) {
+        console.error('[MarkdownViewer] saveCell error:', err);
+        errorMsg.value = err?.message || '保存失败';
+      } finally {
+        saving.value = false;
+      }
+    }
+
+    function handleSelectionChange() {
+      if (hasUnsavedChanges.value) {
+        const discard = window.confirm('当前有未保存的修改，是否放弃？');
+        if (!discard) return;
+      }
+      editing.value = false;
+      loadCell();
+    }
+
     const renderedHtml = computed(() => {
       if (!rawText.value) return '';
       return md.render(rawText.value);
+    });
+
+    const canEdit = computed(() => {
+      return fieldEditable.value && !noSelection.value && !loading.value && !errorMsg.value;
+    });
+
+    const canSave = computed(() => {
+      return !demoMode.value && !saving.value && editing.value;
     });
 
     onMounted(() => {
       loadCell();
       try {
         cancelSelectionWatch = bitable.base.onSelectionChange(() => {
-          loadCell();
+          handleSelectionChange();
         });
       } catch (e) {
         console.warn('[MarkdownViewer] onSelectionChange 注册失败:', e);
@@ -187,6 +267,7 @@ export default {
 
     onUnmounted(() => {
       fetchSeq++;
+      clearTimeout(saveMsgTimer);
       if (typeof cancelSelectionWatch === 'function') {
         cancelSelectionWatch();
         cancelSelectionWatch = null;
@@ -201,7 +282,17 @@ export default {
       errorMsg,
       noSelection,
       demoMode,
+      editing,
+      editText,
+      saving,
+      saveMsg,
+      fieldEditable,
       renderedHtml,
+      canEdit,
+      canSave,
+      enterEdit,
+      exitEdit,
+      saveCell,
     };
   },
 };
@@ -210,16 +301,52 @@ export default {
 <template>
   <div class="md-viewer">
     <!-- header -->
-    <div v-if="tableName || fieldName" class="md-viewer__header">
-      <span class="md-viewer__badge" v-if="tableName">{{ tableName }}</span>
-      <span class="md-viewer__sep" v-if="tableName && fieldName">/</span>
-      <span class="md-viewer__badge md-viewer__badge--field" v-if="fieldName">{{ fieldName }}</span>
+    <div class="md-viewer__header">
+      <div class="md-viewer__header-left">
+        <template v-if="tableName || fieldName">
+          <span class="md-viewer__badge" v-if="tableName">{{ tableName }}</span>
+          <span class="md-viewer__sep" v-if="tableName && fieldName">/</span>
+          <span class="md-viewer__badge md-viewer__badge--field" v-if="fieldName">{{ fieldName }}</span>
+        </template>
+      </div>
+      <div class="md-viewer__header-right">
+        <span v-if="saveMsg" class="md-viewer__toast">{{ saveMsg }}</span>
+        <template v-if="editing">
+          <button
+            class="md-viewer__btn md-viewer__btn--save"
+            :disabled="!canSave"
+            @click="saveCell"
+          >{{ saving ? '保存中…' : '保存' }}</button>
+          <button class="md-viewer__btn" @click="exitEdit">预览</button>
+        </template>
+        <template v-else>
+          <button
+            class="md-viewer__btn"
+            :disabled="!canEdit"
+            :title="!fieldEditable && !demoMode ? '仅文本字段支持编辑' : (demoMode ? '编辑（Demo 模式不可保存）' : '编辑')"
+            @click="enterEdit"
+          >编辑</button>
+        </template>
+      </div>
     </div>
 
     <!-- states -->
     <div v-if="loading" class="md-viewer__status">加载中…</div>
-    <div v-else-if="errorMsg" class="md-viewer__status md-viewer__status--error">{{ errorMsg }}</div>
+    <div v-else-if="errorMsg && !editing" class="md-viewer__status md-viewer__status--error">{{ errorMsg }}</div>
     <div v-else-if="noSelection" class="md-viewer__status">请在多维表格中选中一个单元格</div>
+
+    <!-- editing -->
+    <template v-else-if="editing">
+      <div v-if="errorMsg" class="md-viewer__inline-error">{{ errorMsg }}</div>
+      <textarea
+        class="md-viewer__editor"
+        v-model="editText"
+        placeholder="输入 Markdown 内容…"
+        spellcheck="false"
+      ></textarea>
+    </template>
+
+    <!-- empty -->
     <div v-else-if="!rawText" class="md-viewer__status">单元格为空</div>
 
     <!-- rendered markdown -->
@@ -236,14 +363,27 @@ export default {
 }
 .md-viewer__header {
   flex-shrink: 0;
-  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
   font-size: 12px;
   color: #646a73;
   border-bottom: 1px solid #e5e6eb;
   background: #fafafa;
+  gap: 8px;
+}
+.md-viewer__header-left {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+}
+.md-viewer__header-right {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .md-viewer__badge {
   display: inline-block;
@@ -260,6 +400,43 @@ export default {
   margin: 0 4px;
   color: #c9cdd4;
 }
+.md-viewer__btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #c9cdd4;
+  border-radius: 4px;
+  background: #fff;
+  color: #1f2329;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+.md-viewer__btn:hover:not(:disabled) {
+  background: #f2f3f5;
+  border-color: #8f959e;
+}
+.md-viewer__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.md-viewer__btn--save {
+  background: #3370ff;
+  color: #fff;
+  border-color: #3370ff;
+}
+.md-viewer__btn--save:hover:not(:disabled) {
+  background: #245bdb;
+  border-color: #245bdb;
+}
+.md-viewer__toast {
+  color: #00b42a;
+  font-size: 12px;
+  animation: fadeIn 0.2s;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
 .md-viewer__status {
   flex: 1;
   display: flex;
@@ -272,6 +449,30 @@ export default {
 }
 .md-viewer__status--error {
   color: #f53f3f;
+}
+.md-viewer__inline-error {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: #f53f3f;
+  background: #fff2f0;
+  border-bottom: 1px solid #fde2e2;
+}
+.md-viewer__editor {
+  flex: 1;
+  width: 100%;
+  padding: 12px 16px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  border: none;
+  outline: none;
+  resize: none;
+  background: #fff;
+  color: #1f2329;
+  tab-size: 2;
+}
+.md-viewer__editor:focus {
+  background: #fafbfc;
 }
 .md-viewer__body {
   flex: 1;
